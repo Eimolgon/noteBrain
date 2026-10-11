@@ -1,0 +1,200 @@
+"use strict";
+(() => {
+  const app = { tree: null, index: null, open: [], active: null, editors: new Map(), zen: false, typewriter: false };
+  const $ = (selector) => document.querySelector(selector);
+  const api = async (url, options = {}) => {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    return data;
+  };
+  const send = (url, method, data) => api(url, {
+    method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(data),
+  });
+  const styles = [
+    { name: "Standard", numbers: true, wrap: true },
+    { name: "Code", numbers: true, wrap: false },
+    { name: "Text", numbers: false, wrap: true },
+  ];
+  const palettes = {
+    slate: { bg: "#101419", panel: "#171d24", panel2: "#202832", text: "#dce4ec", muted: "#8795a3", accent: "#8a9cff", border: "#2a3440" },
+    midnight: { bg: "#0d1020", panel: "#141a2c", panel2: "#1c2540", text: "#e0e7ff", muted: "#9ba9cc", accent: "#79b8ff", border: "#303b5b" },
+    forest: { bg: "#101713", panel: "#18221b", panel2: "#223027", text: "#dce9df", muted: "#91a495", accent: "#88c999", border: "#304235" },
+    paper: { bg: "#f5f0e6", panel: "#fffaf0", panel2: "#eee7d9", text: "#332f2a", muted: "#797166", accent: "#a05b36", border: "#d8cfbf" },
+    nord: { bg: "#2E3440", panel: "#3B4252", panel2: "#434C5E", text: "#ECEFF4", muted: "#AEB9CA", accent: "#88C0D0", border: "#4C566A" },
+    dracula: { bg: "#282A36", panel: "#343746", panel2: "#44475A", text: "#F8F8F2", muted: "#B8B8C7", accent: "#BD93F9", border: "#4C4F64" },
+    "solarized-dark": { bg: "#002B36", panel: "#073642", panel2: "#0B4652", text: "#EEE8D5", muted: "#93A1A1", accent: "#2AA198", border: "#164C57" },
+    "solarized-light": { bg: "#FDF6E3", panel: "#EEE8D5", panel2: "#E5DEC9", text: "#586E75", muted: "#839496", accent: "#268BD2", border: "#D6CFBB" },
+    "rose-pine": { bg: "#191724", panel: "#1F1D2E", panel2: "#26233A", text: "#E0DEF4", muted: "#908CAA", accent: "#EBBCBA", border: "#393552" },
+    everforest: { bg: "#2B3339", panel: "#333C43", panel2: "#3A464C", text: "#D3C6AA", muted: "#9DA9A0", accent: "#A7C080", border: "#4A555B" },
+  };
+  const currentStyle = () => styles[Number(localStorage.getItem("vault-style") || 0) % styles.length];
+  function applyStyle(index) {
+    index = (index + styles.length) % styles.length;
+    localStorage.setItem("vault-style", index);
+    $("#style-cycle").textContent = styles[index].name;
+    for (const item of app.editors.values()) {
+      item.cm.setOption("lineNumbers", app.zen ? false : styles[index].numbers);
+      item.cm.setOption("lineWrapping", app.zen || styles[index].wrap);
+      item.cm.refresh();
+    }
+  }
+  function applyPalette(name) {
+    const colors = palettes[name] || palettes.slate;
+    for (const [key, value] of Object.entries(colors)) document.documentElement.style.setProperty(`--${key}`, value);
+    localStorage.setItem("vault-palette", name);
+    document.documentElement.style.colorScheme = name.endsWith("light") || name === "paper" ? "light" : "dark";
+    $("#color-mode").textContent = name.endsWith("light") || name === "paper" ? "☀" : "◐";
+    $("#palette-select").value = name;
+    for (const item of app.editors.values()) {
+      item.cm.setOption("theme", document.documentElement.style.colorScheme === "light" ? "default" : "material-darker");
+      item.cm.refresh();
+    }
+  }
+  function applyFont(size) {
+    document.documentElement.style.setProperty("--editor-font-size", `${size}px`);
+    localStorage.setItem("vault-font-size", size);
+    $("#font-size-label").textContent = `${size} px`;
+    resizeActiveEditor();
+  }
+  const icon = (kind) => {
+    const paths = {
+      folder: "M1.5 5h5l1.3 1.5h6.7v6H1.5z M1.5 5V3.7h4.2L7 5",
+      md: "M3 1.8h6l3 3v9.4H3z M9 1.8v3h3 M5 8h5 M5 10h5 M5 12h3",
+      txt: "M3 1.8h6l3 3v9.4H3z M9 1.8v3h3 M5 8h6 M5 10h6 M5 12h6",
+      tex: "M3 1.8h6l3 3v9.4H3z M9 1.8v3h3 M5 8h6 M8 8v5 M6 13h4",
+    };
+    return `<svg class="icon ${kind}" viewBox="0 0 16 16" aria-hidden="true"><path d="${paths[kind] || paths.md}"/></svg>`;
+  };
+  const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[c]);
+  function renderTree() {
+    const host = $("#file-tree"); host.replaceChildren();
+    function makeNode(node, depth = 0) {
+      if (node.type === "directory") {
+        const details = document.createElement("details"); details.open = depth === 0; details.className = `folder depth-${Math.min(depth, 5)}`;
+        const summary = document.createElement("summary"); summary.innerHTML = `${icon("folder")}<span>${escapeHtml(node.name)}</span>`; details.append(summary);
+        node.children.forEach((child) => details.append(makeNode(child, depth + 1))); return details;
+      }
+      const button = document.createElement("button"); button.className = "file"; button.title = node.path;
+      const ext = node.name.split(".").pop().toLowerCase();
+      button.innerHTML = `${icon(ext === "tex" ? "tex" : ext === "txt" ? "txt" : "md")}<span>${escapeHtml(node.name)}</span>`;
+      button.onclick = () => openFile(node.path); button.draggable = true;
+      button.ondragstart = (event) => event.dataTransfer.setData("text/plain", node.path); return button;
+    }
+    app.tree.children.forEach((node) => host.append(makeNode(node)));
+  }
+  function fillFilter(selector, values, label) {
+    const select = $(selector), old = select.value; select.replaceChildren(new Option(`${label}: all`, ""));
+    Object.keys(values).forEach((value) => select.add(new Option(value, value))); select.value = old;
+  }
+  function renderFilters() {
+    [["#filter-tag", "tags", "Tag"], ["#filter-status", "statuses", "Status"], ["#filter-category", "categories", "Category"], ["#filter-topic", "topics", "Topic"]]
+      .forEach(([selector, key, label]) => fillFilter(selector, app.index[key], label));
+  }
+  function makeEditor(path, content) {
+    const host = document.createElement("div"); host.className = "editor-instance"; host.dataset.path = path; $("#editor-host").append(host);
+    const style = currentStyle();
+    const cm = CodeMirror(host, { value: content, mode: "markdown", theme: document.documentElement.style.colorScheme === "light" ? "default" : "material-darker", keyMap: "vim", lineNumbers: app.zen ? false : style.numbers, lineWrapping: app.zen || style.wrap, readOnly: false, scrollbarStyle: app.zen ? "null" : "native", extraKeys: { "Ctrl-S": () => saveFile(path), "Cmd-S": () => saveFile(path), "Ctrl-C": "copy", "Cmd-C": "copy" } });
+    cm.on("cursorActivity", () => { if (app.active === path) { updateCursor(cm); updateTypewriter(cm); } });
+    cm.on("vim-mode-change", (event) => { if (app.active === path) $("#vim-mode").textContent = (event.mode || "normal").toUpperCase(); });
+    cm.on("change", () => { const item = app.editors.get(path); if (item) { item.dirty = true; renderTabs(); } if (app.active === path) renderPreview(); });
+    app.editors.set(path, { cm, host, dirty: false, typewriterLine: null }); return cm;
+  }
+  async function openFile(path) {
+    if (app.open.includes(path)) { activate(path); return; }
+    const data = await api(`/api/file?path=${encodeURIComponent(path)}`);
+    app.open.push(path); makeEditor(path, data.content); renderTabs(); activate(path);
+  }
+  function renderTabs() {
+    const bar = $("#tabbar"); bar.replaceChildren();
+    app.open.forEach((path) => { const tab = document.createElement("div"); tab.className = `tab${path === app.active ? " active" : ""}`;
+      const label = document.createElement("button"); label.type = "button"; label.textContent = path.split("/").pop(); label.onclick = () => activate(path); tab.append(label);
+      if (app.editors.get(path)?.dirty) { const dot = document.createElement("i"); dot.textContent = "•"; tab.append(dot); }
+      const close = document.createElement("button"); close.type = "button"; close.className = "close"; close.textContent = "×"; close.onclick = (event) => { event.stopPropagation(); closeTab(path); }; tab.append(close); bar.append(tab);
+    });
+  }
+  function activate(path) {
+    app.active = path || null;
+    for (const [key, item] of app.editors) item.host.style.display = key === path ? "block" : "none";
+    renderTabs(); $("#current-file").textContent = path || "No file"; resizeActiveEditor(); renderPreview();
+  }
+  function closeTab(path) {
+    const item = app.editors.get(path); if (!item) return;
+    if (item.dirty && !confirm(`Discard unsaved changes in ${path}?`)) return;
+    item.host.remove(); app.editors.delete(path); app.open = app.open.filter((p) => p !== path);
+    if (app.active === path) activate(app.open.at(-1) || ""); else renderTabs();
+  }
+  function updateCursor(cm) { const c = cm.getCursor(); $("#cursor-pos").textContent = `Ln ${c.line + 1}, Col ${c.ch + 1}`; }
+  function updateTypewriter(cm) {
+    const item = app.editors.get(app.active); if (!item) return;
+    if (item.typewriterLine) { try { cm.removeLineClass(item.typewriterLine, "text", "tw-current"); } catch (_) {} item.typewriterLine = null; }
+    if (app.typewriter) { item.typewriterLine = cm.getLineHandle(cm.getCursor().line); if (item.typewriterLine) cm.addLineClass(item.typewriterLine, "text", "tw-current"); }
+  }
+  function setTypewriter(enabled) { app.typewriter = !!enabled; localStorage.setItem("vault-typewriter", app.typewriter ? "1" : "0"); document.body.classList.toggle("typewriter", app.typewriter); $("#typewriter-toggle").classList.toggle("active", app.typewriter); const item = app.editors.get(app.active); if (item) updateTypewriter(item.cm); }
+  function setZen(enabled) { app.zen = !!enabled; document.body.classList.toggle("zen", app.zen); document.documentElement.classList.toggle("zen", app.zen);
+    for (const item of app.editors.values()) { const style = currentStyle(); item.cm.setOption("lineNumbers", app.zen ? false : style.numbers); item.cm.setOption("lineWrapping", true); item.cm.setOption("scrollbarStyle", app.zen ? "null" : "native"); }
+    resizeActiveEditor();
+  }
+  let resizeFrame = 0;
+  function resizeActiveEditor() {
+    cancelAnimationFrame(resizeFrame); resizeFrame = requestAnimationFrame(() => {
+      const item = app.editors.get(app.active), host = $("#editor-host"); if (!item || !host) return;
+      const rect = host.getBoundingClientRect(); if (rect.width < 100 || rect.height < 80) return;
+      item.cm.setSize(Math.floor(rect.width), Math.floor(rect.height)); item.cm.refresh(); if (app.typewriter) updateTypewriter(item.cm);
+    });
+  }
+  function toggleLeft(forceClose = false) { document.body.classList.toggle("no-left", forceClose || !document.body.classList.contains("no-left")); resizeActiveEditor(); setTimeout(resizeActiveEditor, 60); setTimeout(resizeActiveEditor, 200); }
+  async function saveFile(path) { const item = app.editors.get(path); if (!item) return;
+    try { await send("/api/file", "PUT", { path, content: item.cm.getValue() }); item.dirty = false; renderTabs(); $("#save-state").textContent = "Saved"; app.index = await api("/api/index"); renderFilters(); renderPreview(); }
+    catch (error) { alert(error.message); }
+  }
+  let mathQueue = Promise.resolve();
+  function renderPreview() { const host = $("#right-content"), mode = $("#right-mode").value; host.replaceChildren();
+    if (!app.active) { host.textContent = "No file open"; return; }
+    if (mode === "preview") { host.innerHTML = marked.parse(app.editors.get(app.active)?.cm.getValue() || ""); if (window.MathJax?.typesetPromise) mathQueue = mathQueue.then(() => MathJax.typesetPromise([host])).catch(console.error); return; }
+    const note = app.index.notes.find((x) => x.path === app.active); if (!note) return;
+    if (mode === "references") { const pre = document.createElement("pre"); pre.textContent = JSON.stringify(note.references, null, 2); host.append(pre); }
+    else note.backlinks.forEach((path) => { const button = document.createElement("button"); button.textContent = path; button.onclick = () => openFile(path); host.append(button); });
+  }
+  function debounce(fn, delay) { let timer; return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), delay); }; }
+  async function runSearch() { const params = new URLSearchParams({ q: $("#search").value, tag: $("#filter-tag").value, status: $("#filter-status").value, category: $("#filter-category").value, topic: $("#filter-topic").value });
+    try { const data = await api(`/api/search?${params}`), host = $("#search-results"); host.replaceChildren(); if (![...params.values()].some(Boolean)) return;
+      const count = document.createElement("div"); count.textContent = `${data.count} results`; host.append(count);
+      data.results.forEach((note) => { const button = document.createElement("button"); button.className = "file"; button.textContent = `${note.title} — ${note.path}`; button.onclick = () => openFile(note.path); host.append(button); });
+    } catch (error) { $("#search-results").textContent = `Search error: ${error.message}`; }
+  }
+  async function loadData() { [app.tree, app.index] = await Promise.all([api("/api/tree"), api("/api/index")]); renderTree(); renderFilters(); }
+  function renderTree() { const host = $("#file-tree"); host.replaceChildren();
+    function build(node, depth = 0) { if (node.type === "directory") { const details = document.createElement("details"); details.open = depth === 0; details.className = `folder depth-${Math.min(depth, 5)}`; const summary = document.createElement("summary"); summary.innerHTML = `${icon("folder")}<span>${escapeHtml(node.name)}</span>`; details.append(summary); node.children.forEach((child) => details.append(build(child, depth + 1))); return details; }
+      const button = document.createElement("button"); button.className = "file"; button.title = node.path; const ext = node.name.split(".").pop().toLowerCase(); button.innerHTML = `${icon(ext === "tex" ? "tex" : ext === "txt" ? "txt" : "md")}<span>${escapeHtml(node.name)}</span>`; button.onclick = () => openFile(node.path); button.draggable = true; button.ondragstart = (e) => e.dataTransfer.setData("text/plain", node.path); return button; }
+    app.tree.children.forEach((node) => host.append(build(node)));
+  }
+  function renderFilters() { [["#filter-tag", "tags", "Tag"], ["#filter-status", "statuses", "Status"], ["#filter-category", "categories", "Category"], ["#filter-topic", "topics", "Topic"]].forEach(([id, key, label]) => { const el = $(id), value = el.value; el.replaceChildren(new Option(`${label}: all`, "")); Object.keys(app.index[key]).forEach((x) => el.add(new Option(x, x))); el.value = value; }); }
+  async function reindex() { [app.tree, app.index] = await Promise.all([api("/api/tree"), api("/api/index")]); renderTree(); renderFilters(); runSearch(); renderPreview(); }
+  async function compileReferences() { const data = await api("/api/references"), output = $("#refs-output"); output.hidden = !output.hidden; $("#ref-count").textContent = data.count; if (!output.hidden) output.textContent = data.references.map((r) => `${r.path}: @${r.type}{${r.key}}`).join("\n") || "No references found in info/"; }
+  async function bind() {
+    $("#toggle-left").onclick = () => toggleLeft(); $("#collapse-left").onclick = () => toggleLeft(true);
+    $("#collapse-right").onclick = () => document.body.classList.add("no-right"); $("#toggle-preview").onclick = () => document.body.classList.toggle("no-right"); $("#right-mode").onchange = renderPreview;
+    $("#toggle-zen").onclick = () => setZen(!app.zen); $("#typewriter-toggle").onclick = () => setTypewriter(!app.typewriter);
+    $("#style-cycle").onclick = () => applyStyle(Number(localStorage.getItem("vault-style") || 0) + 1);
+    $("#color-mode").onclick = () => applyPalette(localStorage.getItem("vault-palette") === "paper" ? "slate" : "paper");
+    $("#help-button").onclick = () => $("#help-dialog").showModal();
+    $("#settings-btn").onclick = () => { $("#palette-select").value = localStorage.getItem("vault-palette") || "slate"; $("#font-size").value = localStorage.getItem("vault-font-size") || 14; $("#font-size-label").textContent = `${$("#font-size").value} px`; $("#settings-dialog").showModal(); };
+    $("#font-size").oninput = () => { $("#font-size-label").textContent = `${$("#font-size").value} px`; };
+    $("#apply-settings").onclick = (e) => { e.preventDefault(); applyPalette($("#palette-select").value); applyFont($("#font-size").value); $("#settings-dialog").close(); };
+    $("#new-note").onclick = async () => { const templates = await api("/api/templates"), select = $("#new-template"); select.replaceChildren(new Option("Empty", "")); templates.forEach((t) => select.add(new Option(t.name, t.path))); $("#new-note-form").reset(); $("#new-folder").value = "info"; $("#new-note-dialog").showModal(); };
+    $("#cancel-create").onclick = (e) => { e.preventDefault(); $("#new-note-dialog").close("cancel"); };
+    $("#new-note-form").onsubmit = async (e) => { e.preventDefault(); let name = $("#new-filename").value.trim(); if (!name) { $("#new-filename").reportValidity(); return; } if (!/\.[^/]+$/.test(name)) name += ".md"; const folder = $("#new-folder").value.trim().replace(/\/$/, ""); const data = await send("/api/create", "POST", { path: `${folder ? folder + "/" : ""}${name}`, template: $("#new-template").value }); $("#new-note-dialog").close("created"); await reindex(); openFile(data.path); };
+    $("#save-note").onclick = () => { if (app.active) saveFile(app.active); };
+    $("#search").addEventListener("input", debounce(runSearch, 180)); ["#filter-tag", "#filter-status", "#filter-category", "#filter-topic"].forEach((id) => $(id).addEventListener("change", runSearch));
+    $("#reindex").onclick = () => reindex().catch((e) => alert(e.message)); $("#compile-refs").onclick = () => compileReferences().catch((e) => alert(e.message));
+    $("#editor-host").ondragover = (e) => e.preventDefault(); $("#editor-host").ondrop = (e) => { e.preventDefault(); const path = e.dataTransfer.getData("text/plain"); if (path) openFile(path); };
+    $("#right-content").ondragover = (e) => e.preventDefault(); $("#right-content").ondrop = (e) => { e.preventDefault(); const path = e.dataTransfer.getData("text/plain"); if (path) openFile(path); };
+    document.querySelectorAll(".resizer").forEach((handle) => { let startX, initial; handle.addEventListener("pointerdown", (e) => { e.preventDefault(); startX = e.clientX; const prop = handle.dataset.target === "left" ? "--left-width" : "--right-width"; initial = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(prop)) || 260; handle.setPointerCapture(e.pointerId); }); handle.addEventListener("pointermove", (e) => { if (!handle.hasPointerCapture(e.pointerId)) return; const left = handle.dataset.target === "left", delta = e.clientX - startX, width = Math.max(180, Math.min(700, left ? initial + delta : initial - delta)); document.documentElement.style.setProperty(left ? "--left-width" : "--right-width", `${width}px`); resizeActiveEditor(); }); handle.addEventListener("pointerup", (e) => { if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId); }); });
+    if (window.ResizeObserver) { const observer = new ResizeObserver(resizeActiveEditor); observer.observe($("#workspace")); observer.observe($("#editor-host")); }
+    window.addEventListener("resize", resizeActiveEditor);
+    document.addEventListener("keydown", (e) => { const inField = e.target instanceof HTMLElement && (e.target.matches("input,textarea,select") || e.target.isContentEditable); if (e.altKey && e.key.toLowerCase() === "z") { e.preventDefault(); setZen(!app.zen); } else if (e.altKey && e.key.toLowerCase() === "t") { e.preventDefault(); setTypewriter(!app.typewriter); } else if (e.altKey && e.key.toLowerCase() === "s") { e.preventDefault(); applyStyle(Number(localStorage.getItem("vault-style") || 0) + 1); } else if (e.altKey && e.key.toLowerCase() === "h" && !inField) { e.preventDefault(); $("#help-dialog").showModal(); } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); if (app.active) saveFile(app.active); } });
+  }
+  async function start() { [app.tree, app.index] = await Promise.all([api("/api/tree"), api("/api/index")]); renderTree(); renderFilters(); await bind(); applyPalette(localStorage.getItem("vault-palette") || "slate"); applyFont(localStorage.getItem("vault-font-size") || 14); applyStyle(Number(localStorage.getItem("vault-style") || 0)); setTypewriter(localStorage.getItem("vault-typewriter") === "1"); }
+  start().catch((e) => { console.error(e); alert(`Vault startup failed: ${e.message}`); });
+})();
