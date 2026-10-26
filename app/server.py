@@ -9,6 +9,9 @@ PORT=int(os.environ.get("NOTES_PORT","8765"))
 MD={".md",".markdown"}; TEXT=MD|{".txt",".bib",".tex",".json",".yaml",".yml",".py",".js",".html",".css",".sh"}
 BIB=re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,",re.M)
 WIKI=re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+BACKLINK_START='<!-- AUTO-BACKLINKS:START -->'
+BACKLINK_END='<!-- AUTO-BACKLINKS:END -->'
+BACKLINK_BLOCK=re.compile(r'(?ms)^<!-- AUTO-BACKLINKS:START -->\s*.*?^<!-- AUTO-BACKLINKS:END -->[ \t]*(?:\n|$)')
 FIELDS=re.compile(r"^\s*(id|title|date|deadline|keywords|tags|author|authors|participant|participants|attendee|attendees|category|topic|status|priority)\s*:\s*(.*?)\s*$",re.I|re.M)
 def safe(relpath, *, allow_root=False):
  # Reject absolute paths and traversal before resolving, then verify the resolved
@@ -74,27 +77,77 @@ def metadata(s):
  h=re.search(r'^#\s+(.+?)\s*$|^([^\n=]+)\n=+\s*$',s,re.M)
  if h:m.setdefault('title',(h.group(1) or h.group(2)).strip())
  return m
+def without_generated_backlinks(content):
+ # Generated backlink links must never count as outgoing Zettelkasten links.
+ return BACKLINK_BLOCK.sub('', content)
+def generated_backlink_block(target_path, backlink_paths):
+ if not backlink_paths: return ''
+ lines=[BACKLINK_START, '## Backlinks', '']
+ target_dir=os.path.dirname(target_path) or '.'
+ for source_path in sorted(set(backlink_paths),key=str.casefold):
+  relative=os.path.relpath(source_path,target_dir).replace(os.sep,'/')
+  label=source_path.replace('|','\\|').replace(']', '\\]')
+  lines.append(f'- [[{relative}|{label}]]')
+ lines.extend(['', BACKLINK_END])
+ return '\n'.join(lines)
+def update_backlink_sections():
+ """Maintain generated backlink sections without changing user-authored note text."""
+ data=index_data()
+ backlinks={note['path']:note['backlinks'] for note in data['notes']}
+ changed=0
+ for note in data['notes']:
+  path=note['path']
+  if os.path.splitext(path)[1].lower() not in MD: continue
+  full=safe(path)
+  try: content=read(full)
+  except OSError: continue
+  had_block=bool(BACKLINK_BLOCK.search(content))
+  block=generated_backlink_block(path,backlinks.get(path,[]))
+  if not had_block and not block: continue
+  clean=BACKLINK_BLOCK.sub('',content).rstrip('\n')
+  if block:
+   updated=(clean+'\n\n' if clean else '')+block+'\n'
+  else:
+   updated=clean+'\n' if clean else ''
+  if updated != content:
+   write(full,updated); changed+=1
+ return {'updated':changed}
+
 def all_notes():
  out=[]
  for cur,dirs,names in os.walk(ROOT):
-  dirs[:]=sorted(d for d in dirs if not d.startswith('.') and d not in {'app','__pycache__'})
+  dirs[:]=sorted(d for d in dirs if not d.startswith('.') and d not in {'app','__pycache__'} and not os.path.islink(os.path.join(cur,d)))
   for n in sorted(names):
    p=os.path.join(cur,n)
-   if textfile(p):
+   if not os.path.islink(p) and textfile(p):
     try:
      s=read(p); m=metadata(s); st=os.stat(p)
-     out.append({'path':rel(p),'name':n,'directory':os.path.dirname(rel(p)),'title':m.get('title') or os.path.splitext(n)[0],'id':m.get('id',''),'date':m.get('date',''),'category':m.get('category',''),'topic':m.get('topic',''),'status':m.get('status',''),'priority':m.get('priority',''),'authors':m.get('authors',''),'participants':m.get('participants',''),'keywords':m.get('keywords',''),'tags':m['tags'],'references':[{'type':a.lower(),'key':b} for a,b in BIB.findall(s)],'links':WIKI.findall(s),'modified':st.st_mtime,'size':st.st_size})
+     out.append({'path':rel(p),'name':n,'directory':os.path.dirname(rel(p)),'title':m.get('title') or os.path.splitext(n)[0],'id':m.get('id',''),'date':m.get('date',''),'category':m.get('category',''),'topic':m.get('topic',''),'status':m.get('status',''),'priority':m.get('priority',''),'authors':m.get('authors',''),'participants':m.get('participants',''),'keywords':m.get('keywords',''),'tags':m['tags'],'references':[{'type':a.lower(),'key':b} for a,b in BIB.findall(s)],'links':WIKI.findall(without_generated_backlinks(s)),'modified':st.st_mtime,'size':st.st_size})
     except OSError:pass
  return out
 def index_data():
- notes=all_notes(); by={n['path']:n for n in notes}; lookup={}
+ notes=all_notes(); by={n['path']:n for n in notes}; by_case={p.casefold():p for p in by}; lookup={}
  for n in notes:
-  for key in (n['path'],n['name'],n['title'],n['id']):
-   if key: lookup.setdefault(key.lower(),n['path'])
+  stem=os.path.splitext(n['name'])[0]
+  path_stem=os.path.splitext(n['path'])[0]
+  for key in (n['path'],path_stem,n['name'],stem,n['title'],n['id']):
+   if key: lookup.setdefault(key.strip().casefold(),n['path'])
  for n in notes: n['resolved_links']=[]; n['backlinks']=[]
  for n in notes:
   for link in n['links']:
-   target=lookup.get(link.strip().lower())
+   raw=link.strip().replace('\\','/').lstrip('/')
+   target=None
+   # Path-like wiki links resolve relative to the source note first, then from
+   # the vault root. Extensionless paths are accepted as Markdown note paths.
+   if '/' in raw or re.search(r'\.(md|markdown)$',raw,re.I):
+    candidates=[os.path.normpath(os.path.join(os.path.dirname(n['path']),raw)).replace(os.sep,'/'),os.path.normpath(raw).replace(os.sep,'/')]
+    if not re.search(r'\.(md|markdown)$',raw,re.I):
+     candidates += [c+'.md' for c in list(candidates)]
+    for candidate in candidates:
+     target=by_case.get(candidate.casefold())
+     if target: break
+   if not target:
+    target=lookup.get(raw.casefold())
    if target and target in by and target not in n['resolved_links']:
     n['resolved_links'].append(target)
     if n['path'] not in by[target]['backlinks']: by[target]['backlinks'].append(n['path'])
@@ -184,13 +237,13 @@ def tree():
   try: entries=sorted(os.scandir(p),key=lambda e:(not e.is_dir(),e.name.lower()))
   except OSError:return node
   for e in entries:
-   if e.name.startswith('.') or e.name in {'app','__pycache__'}:continue
-   if e.is_dir():node['children'].append(walk(e.path))
-   elif textfile(e.path):node['children'].append({'name':e.name,'path':rel(e.path),'type':'file'})
+   if e.name.startswith('.') or e.name in {'app','__pycache__'} or e.is_symlink():continue
+   if e.is_dir(follow_symlinks=False):node['children'].append(walk(e.path))
+   elif e.is_file(follow_symlinks=False) and textfile(e.path):node['children'].append({'name':e.name,'path':rel(e.path),'type':'file'})
   return node
  return walk(ROOT)
 class Handler(BaseHTTPRequestHandler):
- server_version='VaultWorkbench/2.0'
+ server_version='VaultWorkbench/2.1'
  def log_message(self,*a):pass
  def sendj(self,status,data):
   b=json.dumps(data,ensure_ascii=False).encode();self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(b)
@@ -226,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
     return self.sendj(200,{'references':refs,'count':len(refs)})
    if u.path=='/api/templates':
     p=safe('templates'); vals=[]
-    if os.path.isdir(p):vals=[{'name':n,'path':'templates/'+n} for n in sorted(os.listdir(p)) if os.path.isfile(os.path.join(p,n)) and textfile(n)]
+    if os.path.isdir(p):vals=[{'name':n,'path':'templates/'+n} for n in sorted(os.listdir(p)) if not os.path.islink(os.path.join(p,n)) and os.path.isfile(os.path.join(p,n)) and textfile(n)]
     return self.sendj(200,vals)
    return self.sendj(404,{'error':'Unknown endpoint'})
   except Exception as e:return self.sendj(400,{'error':str(e)})
@@ -253,7 +306,10 @@ class Handler(BaseHTTPRequestHandler):
       return self.sendj(422,{'error':'PDF export failed. Check that a PDF engine such as LaTeX is installed. '+detail[-1800:]})
      with open(output,'rb') as f: encoded=base64.b64encode(f.read()).decode('ascii')
     return self.sendj(200,{'filename':os.path.splitext(filename)[0]+'.pdf','pdf_base64':encoded})
-   if route=='/api/reindex': return self.sendj(200,{**generate_info_index(),'reindexed':True})
+   if route=='/api/reindex':
+    index_result=generate_info_index()
+    backlinks=update_backlink_sections()
+    return self.sendj(200,{**index_result,**backlinks,'reindexed':True})
    if route=='/api/collect-bibtex': return self.sendj(200,collect_bibtex())
    if route=='/api/create':
     name=d.get('path','').strip()
@@ -296,6 +352,12 @@ class Handler(BaseHTTPRequestHandler):
  def static(self,name):
   p=os.path.abspath(os.path.join(STATIC,name))
   if not p.startswith(STATIC+os.sep) or not os.path.isfile(p):return self.sendj(404,{'error':'Static file not found'})
-  typ=mimetypes.guess_type(p)[0] or 'application/octet-stream';b=open(p,'rb').read();self.send_response(200);self.send_header('Content-Type',typ+'; charset=utf-8' if typ.startswith(('text/','application/javascript')) else typ);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+  typ=mimetypes.guess_type(p)[0] or 'application/octet-stream'
+  with open(p,'rb') as f: b=f.read()
+  self.send_response(200);self.send_header('Content-Type',typ+'; charset=utf-8' if typ.startswith(('text/','application/javascript')) else typ);self.send_header('Content-Length',str(len(b)))
+  # The UI is designed to work offline and must not silently fetch remote assets.
+  # Inline styles/scripts are required by the existing UI and MathJax configuration.
+  self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self'")
+  self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(b)
 if __name__=='__main__':
  print('Vault:',ROOT);print(f'Open http://127.0.0.1:{PORT}');ThreadingHTTPServer(('127.0.0.1',PORT),Handler).serve_forever()

@@ -109,8 +109,8 @@
     const cm = CodeMirror(host, { value: content, mode: "markdown", theme: document.documentElement.style.colorScheme === "light" ? "default" : "material-darker", keyMap: "vim", lineNumbers: app.zen ? false : effectiveEditorOption("numbers", style), lineWrapping: app.zen || effectiveEditorOption("wrap", style), readOnly: false, scrollbarStyle: app.zen ? null : "native", extraKeys: { "Ctrl-S": () => saveFile(path), "Cmd-S": () => saveFile(path), "Ctrl-C": "copy", "Cmd-C": "copy" } });
     cm.on("cursorActivity", () => { if (app.active === path) { updateCursor(cm); updateTypewriter(cm); } });
     cm.on("vim-mode-change", (event) => { if (app.active === path) $("#vim-mode").textContent = (event.mode || "normal").toUpperCase(); });
-    cm.on("change", () => { const item = app.editors.get(path); if (item) { item.dirty = true; renderTabs(); } if (app.active === path) renderPreview(); });
-    app.editors.set(path, { cm, host, dirty: false, typewriterLine: null }); return cm;
+    cm.on("change", () => { const item = app.editors.get(path); if (item) { item.dirty = true; item.revision += 1; renderTabs(); } if (app.active === path) renderPreview(); });
+    app.editors.set(path, { cm, host, dirty: false, revision: 0, typewriterLine: null }); return cm;
   }
   async function openFile(path) {
     if (app.open.includes(path)) { activate(path); return; }
@@ -182,9 +182,29 @@
     // not be display:none or the remaining columns auto-place into the wrong tracks.
     requestAnimationFrame(() => { resizeActiveEditor(); });
   }
-  async function saveFile(path) { const item = app.editors.get(path); if (!item) return false;
-    try { await send("/api/file", "PUT", { path, content: item.cm.getValue() }); item.dirty = false; renderTabs(); $("#save-state").textContent = "Saved"; app.index = await api("/api/index"); renderFilters(); renderPreview(); return true; }
-    catch (error) { $("#save-state").textContent = `Save failed: ${error.message}`; alert(`Could not save ${path}: ${error.message}`); return false; }
+  async function saveFile(path) {
+    const item = app.editors.get(path);
+    if (!item) return false;
+    try {
+      // If the user keeps typing while a request is in flight, save again rather
+      // than incorrectly marking newer, unsent editor contents as saved.
+      do {
+        const revision = item.revision;
+        const content = item.cm.getValue();
+        await send("/api/file", "PUT", { path, content });
+        if (app.editors.get(path) !== item) return true;
+        if (revision === item.revision) item.dirty = false;
+        else item.dirty = true;
+        renderTabs();
+      } while (item.dirty && app.editors.get(path) === item);
+      $("#save-state").textContent = "Saved";
+      await reindex();
+      return true;
+    } catch (error) {
+      $("#save-state").textContent = `Save failed: ${error.message}`;
+      alert(`Could not save ${path}: ${error.message}`);
+      return false;
+    }
   }
   async function createFolder() {
     const parent = prompt("Parent folder (relative to the vault; leave empty for the vault root):", "");
@@ -209,9 +229,63 @@
     } catch (error) { alert(`Could not delete ${path}: ${error.message}`); }
   }
   let mathQueue = Promise.resolve();
+  function resolveNoteTarget(target, sourcePath = app.active) {
+    const notes = app.index?.notes || [];
+    const raw = String(target || "").trim().replace(/\\/g, "/");
+    if (!raw) return null;
+    const clean = raw.replace(/[?#].*$/, "").replace(/^\.\//, "");
+    const key = clean.toLocaleLowerCase();
+    const byPath = new Map(notes.map((note) => [note.path.toLocaleLowerCase(), note.path]));
+    const candidates = [];
+    if (clean.startsWith("/")) candidates.push(clean.slice(1));
+    else {
+      if (sourcePath) candidates.push(`${sourcePath.includes("/") ? sourcePath.slice(0, sourcePath.lastIndexOf("/")) + "/" : ""}${clean}`);
+      candidates.push(clean);
+    }
+    for (const candidate of [...candidates]) {
+      const normalized = candidate.split("/").reduce((parts, part) => { if (!part || part === ".") return parts; if (part === "..") parts.pop(); else parts.push(part); return parts; }, []).join("/");
+      for (const path of [normalized, ...(/\.(md|markdown)$/i.test(normalized) ? [] : [`${normalized}.md`, `${normalized}.markdown`])]) {
+        if (byPath.has(path.toLocaleLowerCase())) return byPath.get(path.toLocaleLowerCase());
+      }
+    }
+    const matches = notes.filter((note) => [note.path, note.name, note.title, note.id, note.path.replace(/\.(md|markdown)$/i, ""), note.name.replace(/\.(md|markdown)$/i, "")].some((value) => value && value.toLocaleLowerCase() === key));
+    return matches.length ? matches[0].path : null;
+  }
+  function prepareWikiLinks(markdown) {
+    return markdown.replace(/\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g, (_whole, target, heading, label) => {
+      const href = `#vault-note=${encodeURIComponent(target.trim())}${heading ? `&heading=${encodeURIComponent(heading.trim())}` : ""}`;
+      return `[${(label || target).trim().replace(/([\\[\]])/g, "\\$1")}](${href})`;
+    });
+  }
+  function handlePreviewLink(event) {
+    const anchor = event.target.closest?.("a[href]");
+    if (!anchor || !$("#right-content").contains(anchor)) return;
+    const href = anchor.getAttribute("href") || "";
+    let target = null;
+    if (href.startsWith("#vault-note=")) {
+      event.preventDefault();
+      const name = href.slice("#vault-note=".length).split("&")[0];
+      let decoded = name;
+      try { decoded = decodeURIComponent(name); } catch (_) {}
+      target = resolveNoteTarget(decoded);
+    } else {
+      try {
+        const base = new URL(`http://vault.local/${app.active || ""}`);
+        const url = new URL(href, base);
+        const isLocalApp = url.hostname === "vault.local" || ((url.hostname === "127.0.0.1" || url.hostname === "localhost") && (!window.location.port || url.port === window.location.port));
+        if (isLocalApp && /\.(md|markdown)$/i.test(url.pathname)) {
+          const path = decodeURIComponent(url.pathname.replace(/^\//, ""));
+          target = resolveNoteTarget(path, "");
+          if (!target) target = resolveNoteTarget(path, app.active);
+          if (target) event.preventDefault();
+        }
+      } catch (_) {}
+    }
+    if (target) openFile(target).catch((error) => alert(`Could not open linked note: ${error.message}`));
+  }
   function renderPreview() { const host = $("#right-content"), mode = $("#right-mode").value; host.replaceChildren();
     if (!app.active) { host.textContent = "No file open"; return; }
-    if (mode === "preview") { host.innerHTML = marked.parse(app.editors.get(app.active)?.cm.getValue() || ""); if (window.MathJax?.typesetPromise) mathQueue = mathQueue.then(() => MathJax.typesetPromise([host])).catch(console.error); return; }
+    if (mode === "preview") { const source = app.editors.get(app.active)?.cm.getValue() || ""; const rendered = marked.parse(prepareWikiLinks(source)); host.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(rendered) : escapeHtml(rendered); if (window.MathJax?.typesetPromise) mathQueue = mathQueue.then(() => MathJax.typesetPromise([host])).catch(console.error); return; }
     const note = app.index.notes.find((x) => x.path === app.active); if (!note) return;
     if (mode === "references") { const pre = document.createElement("pre"); pre.textContent = JSON.stringify(note.references, null, 2); host.append(pre); }
     else note.backlinks.forEach((path) => { const button = document.createElement("button"); button.textContent = path; button.onclick = () => openFile(path); host.append(button); });
@@ -244,8 +318,36 @@
     app.tree.children.forEach((node) => host.append(build(node)));
   }
   function renderFilters() { [["#filter-tag", "tags", "Tag"], ["#filter-status", "statuses", "Status"], ["#filter-category", "categories", "Category"], ["#filter-topic", "topics", "Topic"]].forEach(([id, key, label]) => { const el = $(id), value = el.value; el.replaceChildren(new Option(`${label}: all`, "")); Object.keys(app.index[key]).forEach((x) => el.add(new Option(x, x))); el.value = value; }); }
+  function mergeGeneratedBacklinks(current, canonical) {
+    const blockPattern = /^<!-- AUTO-BACKLINKS:START -->\s*[\s\S]*?^<!-- AUTO-BACKLINKS:END -->[ \t]*(?:\n|$)/m;
+    const match = canonical.match(blockPattern);
+    const currentHasBlock = blockPattern.test(current);
+    if (!match && !currentHasBlock) return current;
+    const authored = current.replace(blockPattern, "").replace(/\n+$/, "");
+    const block = match ? match[0].trimEnd() : "";
+    return (authored ? authored + (block ? "\n\n" : "\n") : "") + (block ? block + "\n" : "");
+  }
+  async function syncOpenEditorBacklinkBlocks() {
+    // The server owns the generated block; merge only that block into open buffers,
+    // preserving any unrelated unsaved edits the user has made in other tabs.
+    for (const [path, item] of app.editors) {
+      try {
+        const canonical = await api(`/api/file?path=${encodeURIComponent(path)}`);
+        const merged = mergeGeneratedBacklinks(item.cm.getValue(), canonical.content);
+        if (merged !== item.cm.getValue()) {
+          const wasDirty = item.dirty;
+          item.cm.setValue(merged);
+          item.dirty = wasDirty;
+        }
+      } catch (error) {
+        console.warn(`Could not refresh generated backlinks for ${path}:`, error);
+      }
+    }
+    renderTabs();
+  }
   async function reindex() {
     const result = await send("/api/reindex", "POST", {});
+    await syncOpenEditorBacklinkBlocks();
     [app.tree, app.index] = await Promise.all([api("/api/tree"), api("/api/index")]);
     renderTree(); renderFilters(); await runSearch(); renderPreview();
     return result;
@@ -275,6 +377,7 @@
   }
   async function bind() {
     setupActionIcons();
+    $("#right-content").addEventListener("click", handlePreviewLink);
     $("#toggle-left").onclick = () => toggleLeft(); $("#collapse-left").onclick = () => toggleLeft(true);
     $("#collapse-right").onclick = () => document.body.classList.add("no-right"); $("#toggle-preview").onclick = () => document.body.classList.toggle("no-right"); $("#right-mode").onchange = renderPreview;
     $("#toggle-zen").onclick = () => setZen(!app.zen); $("#typewriter-toggle").onclick = () => setTypewriter(!app.typewriter);
