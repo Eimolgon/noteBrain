@@ -1,35 +1,76 @@
 #!/usr/bin/env python3
 """Portable local Markdown vault UI. Run from your vault root: python app/server.py"""
-import json, os, re, time, mimetypes
+import json, os, re, time, mimetypes, tempfile, shutil, subprocess, base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
-ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT=os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STATIC=os.path.join(os.path.dirname(os.path.abspath(__file__)),"static")
 PORT=int(os.environ.get("NOTES_PORT","8765"))
 MD={".md",".markdown"}; TEXT=MD|{".txt",".bib",".tex",".json",".yaml",".yml",".py",".js",".html",".css",".sh"}
 BIB=re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,",re.M)
 WIKI=re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
-FIELDS=re.compile(r"^\s*(id|title|date|deadline|keywords|participants|category|topic|status|priority)\s*:\s*(.*?)\s*$",re.I|re.M)
-def safe(rel):
- rel=unquote(rel).lstrip('/\\'); p=os.path.abspath(os.path.join(ROOT,rel))
- if p!=ROOT and not p.startswith(ROOT+os.sep): raise ValueError('Path escapes vault root')
+FIELDS=re.compile(r"^\s*(id|title|date|deadline|keywords|tags|author|authors|participant|participants|attendee|attendees|category|topic|status|priority)\s*:\s*(.*?)\s*$",re.I|re.M)
+def safe(relpath, *, allow_root=False):
+ # Reject absolute paths and traversal before resolving, then verify the resolved
+ # destination remains inside the vault. Reject symlinks in existing path components
+ # so operations never unexpectedly follow a link to another location.
+ if not isinstance(relpath, str) or not relpath.strip():
+  if allow_root: return ROOT
+  raise ValueError('A relative path is required')
+ raw=unquote(relpath).replace('\\','/')
+ if raw.startswith('/') or re.match(r'^[A-Za-z]:', raw): raise ValueError('Absolute paths are not allowed')
+ parts=raw.split('/')
+ if any(part in ('.','..') for part in parts): raise ValueError('Path traversal is not allowed')
+ p=os.path.abspath(os.path.join(ROOT, *parts))
+ resolved=os.path.realpath(p)
+ if os.path.commonpath((ROOT,resolved)) != ROOT: raise ValueError('Path escapes vault root')
+ current=ROOT
+ for part in parts:
+  if not part: continue
+  current=os.path.join(current,part)
+  if os.path.islink(current): raise ValueError('Symbolic links are not supported for file operations')
+ if p==ROOT and not allow_root: raise ValueError('The vault root is not a file path')
  return p
 def rel(p): return os.path.relpath(p,ROOT).replace(os.sep,'/')
 def textfile(p): return os.path.splitext(p)[1].lower() in TEXT
 def read(p):
  with open(p,encoding='utf-8',errors='replace') as f:return f.read()
 def write(p,s):
- os.makedirs(os.path.dirname(p),exist_ok=True); tmp=p+'.tmp'
- with open(tmp,'w',encoding='utf-8',newline='') as f:f.write(s)
- os.replace(tmp,p)
+ # Atomic replacement in the destination directory; unique temporary files avoid
+ # collisions between concurrent saves.
+ directory=os.path.dirname(p)
+ fd,tmp=tempfile.mkstemp(prefix='.notes-tmp-',dir=directory,text=True)
+ try:
+  with os.fdopen(fd,'w',encoding='utf-8',newline='') as f: f.write(s)
+  os.replace(tmp,p)
+ except Exception:
+  try: os.unlink(tmp)
+  except OSError: pass
+  raise
+def populate_template(content, template_path):
+ from datetime import date
+ today=date.today().isoformat()
+ # Fill only empty Date metadata fields; never replace an existing value.
+ content=re.sub(r'(?im)^(\s*Date\s*:\s*)$', lambda m: m.group(1)+today, content)
+ # The daily template explicitly uses this placeholder as its heading.
+ if template_path.replace('\\','/').lower() == 'templates/daily.md':
+  content=re.sub(r'(?m)^yymmdd\s*$', date.today().strftime('%y%m%d'), content, count=1)
+ return content
 def metadata(s):
- m={k.lower():v.strip() for k,v in FIELDS.findall(s)}
+ # Read existing metadata conventions, including fields inside fenced blocks.
+ m={k.lower():v.strip().strip('"\'') for k,v in FIELDS.findall(s)}
  tm=re.search(r'^Tags\s*\n=+\s*(.*?)(?=^\S|\Z)',s,re.M|re.S)
  tags=[]
  if tm:
   for line in tm.group(1).splitlines():
-   if ':' in line: tags += [x.strip() for x in re.split('[,;]',line.split(':',1)[1]) if x.strip()]
- m['tags']=sorted(set(tags))
+   if ':' in line: tags += [x.strip().strip('"\'') for x in re.split('[,;]',line.split(':',1)[1]) if x.strip()]
+ if m.get('tags'): tags += [x.strip() for x in re.split('[,;]',m['tags']) if x.strip()]
+ m['tags']=sorted(set(tags),key=str.lower)
+ m['authors']=m.get('authors') or m.get('author','')
+ if not m['authors']:
+  bib_authors=re.findall(r'(?im)^\s*author\s*=\s*[\{\"](.*?)[\}\"]\s*,?\s*$',s)
+  if bib_authors: m['authors']='; '.join(re.sub(r'\s+',' ',v).strip() for v in bib_authors)
+ m['participants']=m.get('participants') or m.get('participant') or m.get('attendees') or m.get('attendee','')
  h=re.search(r'^#\s+(.+?)\s*$|^([^\n=]+)\n=+\s*$',s,re.M)
  if h:m.setdefault('title',(h.group(1) or h.group(2)).strip())
  return m
@@ -42,27 +83,101 @@ def all_notes():
    if textfile(p):
     try:
      s=read(p); m=metadata(s); st=os.stat(p)
-     out.append({'path':rel(p),'name':n,'directory':os.path.dirname(rel(p)),'title':m.get('title') or os.path.splitext(n)[0],'id':m.get('id',''),'date':m.get('date',''),'category':m.get('category',''),'topic':m.get('topic',''),'status':m.get('status',''),'priority':m.get('priority',''),'tags':m['tags'],'references':[{'type':a.lower(),'key':b} for a,b in BIB.findall(s)],'links':WIKI.findall(s),'modified':st.st_mtime,'size':st.st_size})
+     out.append({'path':rel(p),'name':n,'directory':os.path.dirname(rel(p)),'title':m.get('title') or os.path.splitext(n)[0],'id':m.get('id',''),'date':m.get('date',''),'category':m.get('category',''),'topic':m.get('topic',''),'status':m.get('status',''),'priority':m.get('priority',''),'authors':m.get('authors',''),'participants':m.get('participants',''),'keywords':m.get('keywords',''),'tags':m['tags'],'references':[{'type':a.lower(),'key':b} for a,b in BIB.findall(s)],'links':WIKI.findall(s),'modified':st.st_mtime,'size':st.st_size})
     except OSError:pass
  return out
 def index_data():
- notes=all_notes(); by={n['path']:n for n in notes}
- lookup={}
+ notes=all_notes(); by={n['path']:n for n in notes}; lookup={}
  for n in notes:
   for key in (n['path'],n['name'],n['title'],n['id']):
-   if key:lookup.setdefault(key.lower(),n['path'])
- for n in notes:
-  n['resolved_links']=[];n['backlinks']=[]
+   if key: lookup.setdefault(key.lower(),n['path'])
+ for n in notes: n['resolved_links']=[]; n['backlinks']=[]
  for n in notes:
   for link in n['links']:
    target=lookup.get(link.strip().lower())
-   if target and target in by:n['resolved_links'].append(target);by[target]['backlinks'].append(n['path'])
- sets={k:{} for k in ('tags','statuses','categories','topics')}
+   if target and target in by and target not in n['resolved_links']:
+    n['resolved_links'].append(target)
+    if n['path'] not in by[target]['backlinks']: by[target]['backlinks'].append(n['path'])
+ sets={k:{} for k in ('tags','statuses','categories','topics','authors','participants','keywords')}
  for n in notes:
-  for tag in n['tags']:sets['tags'].setdefault(tag,[]).append(n['path'])
-  for field,bucket in [('status','statuses'),('category','categories'),('topic','topics')]:
-   if n[field]:sets[bucket].setdefault(n[field],[]).append(n['path'])
+  for tag in n['tags']: sets['tags'].setdefault(tag,[]).append(n['path'])
+  for field,bucket in [('status','statuses'),('category','categories'),('topic','topics'),('authors','authors'),('participants','participants'),('keywords','keywords')]:
+   splitter=r'\s+and\s+|;' if field=='authors' else '[,;]'
+   for value in [v.strip() for v in re.split(splitter,n.get(field,'') or '',flags=re.I) if v.strip()]: sets[bucket].setdefault(value,[]).append(n['path'])
  return {'generated':time.time(),'notes':notes,**{k:dict(sorted(v.items(),key=lambda x:x[0].lower())) for k,v in sets.items()}}
+
+def generate_info_index():
+ """Regenerate info/index.md in the existing alphabetical-list format."""
+ info=safe('info')
+ if not os.path.isdir(info): raise ValueError('The info/ directory does not exist')
+ entries=[]
+ for cur,dirs,names in os.walk(info):
+  dirs[:]=sorted(d for d in dirs if not d.startswith('.') and not os.path.islink(os.path.join(cur,d)))
+  for name in sorted(names,key=str.lower):
+   path=os.path.join(cur,name); rp=rel(path)
+   if os.path.islink(path) or os.path.splitext(name)[1].lower() not in MD or rp.lower() in {'info/index.md','info/readme.md'}: continue
+   content=read(path); meta=metadata(content); title=(meta.get('title') or os.path.splitext(name)[0]).strip()
+   target=os.path.relpath(path,info).replace(os.sep,'/')
+   entries.append((title,target))
+ groups={}
+ for title,target in entries:
+  first=title[:1].upper(); group=first if 'A' <= first <= 'Z' else '#'
+  groups.setdefault(group,[]).append((title,target))
+ lines=['id: Index','=========','']
+ for group in list('ABCDEFGHIJKLMNOPQRSTUVWXYZ')+['#']:
+  lines.extend([group,'-',''])
+  for title,target in sorted(groups.get(group,[]),key=lambda x:(x[0].casefold(),x[1].casefold())):
+   label=title.replace('[','\\[').replace(']','\\]')
+   lines.append(f'- [{label}]({target})')
+  lines.append('')
+ write(os.path.join(info,'index.md'),'\n'.join(lines).rstrip()+'\n')
+ return {'path':'info/index.md','count':len(entries)}
+
+def bib_entries(content):
+ """Extract complete BibTeX entries by balanced braces, including multiline fields."""
+ out=[]
+ for match in re.finditer(r'@([A-Za-z]+)\s*([({])\s*([^,\s]+)\s*,',content):
+  start=match.start(); opener=match.group(2); closer='}' if opener=='{' else ')'; depth=0; quote=False; escaped=False; end=None
+  for i in range(content.find(opener,match.start()),len(content)):
+   ch=content[i]
+   if escaped: escaped=False; continue
+   if ch=='\\': escaped=True; continue
+   if ch=='"': quote=not quote; continue
+   if quote: continue
+   if ch==opener: depth+=1
+   elif ch==closer:
+    depth-=1
+    if depth==0: end=i+1; break
+  if end: out.append({'type':match.group(1).lower(),'key':match.group(3).strip(),'text':content[start:end].strip()})
+ return out
+
+def collect_bibtex():
+ """Write a deterministic, deduplicated bibliography from Markdown notes in info/."""
+ info=safe('info')
+ if not os.path.isdir(info): raise ValueError('The info/ directory does not exist')
+ found=[]
+ for cur,dirs,names in os.walk(info):
+  dirs[:]=sorted(d for d in dirs if not d.startswith('.') and not os.path.islink(os.path.join(cur,d)))
+  for name in sorted(names,key=str.lower):
+   path=os.path.join(cur,name)
+   if os.path.islink(path) or os.path.splitext(name)[1].lower() not in MD or rel(path).lower() in {'info/index.md','info/readme.md'}: continue
+   for entry in bib_entries(read(path)): found.append((rel(path),entry))
+ found.sort(key=lambda x:(x[0].casefold(),x[1]['key'].casefold()))
+ unique={}; conflicts=[]
+ for source,entry in found:
+  key=entry['key'].casefold()
+  if key not in unique: unique[key]=(source,entry)
+  elif re.sub(r'\s+',' ',unique[key][1]['text']) != re.sub(r'\s+',' ',entry['text']): conflicts.append({'key':entry['key'],'kept_from':unique[key][0],'duplicate_from':source})
+ content='\n\n'.join(v[1]['text'] for v in unique.values())
+ marker='% Generated automatically by Vault Workbench; do not edit this file directly.'
+ content=marker+'\n\n'+content.rstrip()+'\n'
+ destination=safe('info/references.bib')
+ # Never overwrite a manually maintained bibliography: only replace a file that
+ # carries our generator marker from a previous run.
+ if os.path.exists(destination) and marker not in read(destination):
+  raise ValueError('info/references.bib already exists and is not marked as generated; move it or choose another output path before collecting references')
+ write(destination,content)
+ return {'path':'info/references.bib','count':len(unique),'found':len(found),'duplicates':len(found)-len(unique),'conflicts':conflicts}
 def tree():
  def walk(p):
   node={'name':os.path.basename(p) or '.','path':rel(p),'type':'directory','children':[]}
@@ -92,13 +207,15 @@ class Handler(BaseHTTPRequestHandler):
     if not os.path.isfile(p):return self.sendj(404,{'error':'File not found'})
     s=read(p);return self.sendj(200,{'path':rel(p),'content':s,'metadata':metadata(s),'references':[{'type':a.lower(),'key':b} for a,b in BIB.findall(s)]})
    if u.path=='/api/search':
-    qtext=q.get('q',[''])[0].lower().strip(); tag=q.get('tag',[''])[0].lower(); status=q.get('status',[''])[0].lower();cat=q.get('category',[''])[0].lower();topic=q.get('topic',[''])[0].lower();res=[]
+    qtext=q.get('q',[''])[0].lower().strip(); tag=q.get('tag',[''])[0].lower(); status=q.get('status',[''])[0].lower();cat=q.get('category',[''])[0].lower();topic=q.get('topic',[''])[0].lower();author=q.get('author',[''])[0].lower();participant=q.get('participant',[''])[0].lower();res=[]
     for n in all_notes():
      if tag and tag not in [x.lower() for x in n['tags']]:continue
      if status and n['status'].lower()!=status:continue
      if cat and n['category'].lower()!=cat:continue
-     if topic and n['topic'].lower()!=topic:continue
-     if qtext and qtext not in ' '.join([n['path'],n['title'],n['id'],n['date'],n['category'],n['topic'],n['status'],n['priority'],' '.join(n['tags']),read(safe(n['path']))]).lower():continue
+     if topic and topic not in [x.strip().lower() for x in re.split('[,;]',n['topic'])]:continue
+     if author and author not in [x.strip().lower() for x in re.split(r'\s+and\s+|;',n['authors'],flags=re.I)]:continue
+     if participant and participant not in [x.strip().lower() for x in re.split('[,;]',n['participants'])]:continue
+     if qtext and qtext not in ' '.join([n['path'],n['title'],n['id'],n['date'],n['category'],n['topic'],n['status'],n['priority'],n['authors'],n['participants'],n['keywords'],' '.join(n['tags']),read(safe(n['path']))]).lower():continue
      res.append(n)
     return self.sendj(200,{'count':len(res),'results':res})
    if u.path=='/api/references':
@@ -116,19 +233,56 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   try:
    d=self.body();route=urlparse(self.path).path
+   if route=='/api/export-pdf':
+    # Export the current editor contents without requiring a save first.
+    if shutil.which('pandoc') is None:
+     return self.sendj(503,{'error':'Pandoc is not installed or is not available on PATH. Install Pandoc, restart the application, and try again.'})
+    content=d.get('content','')
+    filename=os.path.basename(str(d.get('filename') or 'note.md'))
+    if not filename.lower().endswith(('.md','.markdown')): filename='note.md'
+    with tempfile.TemporaryDirectory(prefix='vault-pdf-') as tmp:
+     source=os.path.join(tmp,filename)
+     output=os.path.join(tmp,os.path.splitext(filename)[0]+'.pdf')
+     with open(source,'w',encoding='utf-8',newline='') as f: f.write(content)
+     try:
+      result=subprocess.run(['pandoc',source,'--from=markdown','--to=pdf','--output',output],capture_output=True,text=True,timeout=120,check=False)
+     except subprocess.TimeoutExpired:
+      return self.sendj(504,{'error':'PDF export timed out after 120 seconds.'})
+     if result.returncode != 0:
+      detail=(result.stderr or result.stdout or 'Pandoc could not create the PDF.').strip()
+      return self.sendj(422,{'error':'PDF export failed. Check that a PDF engine such as LaTeX is installed. '+detail[-1800:]})
+     with open(output,'rb') as f: encoded=base64.b64encode(f.read()).decode('ascii')
+    return self.sendj(200,{'filename':os.path.splitext(filename)[0]+'.pdf','pdf_base64':encoded})
+   if route=='/api/reindex': return self.sendj(200,{**generate_info_index(),'reindexed':True})
+   if route=='/api/collect-bibtex': return self.sendj(200,collect_bibtex())
    if route=='/api/create':
     name=d.get('path','').strip()
     if not os.path.splitext(name)[1]:name+='.md'
     p=safe(name)
     if os.path.exists(p):return self.sendj(409,{'error':'File already exists'})
+    if not os.path.isdir(os.path.dirname(p)): return self.sendj(400,{'error':'Destination folder does not exist'})
     tpl=d.get('template','');content=''
     if tpl:
      t=safe(tpl)
      if not os.path.isfile(t) or not rel(t).startswith('templates/'):return self.sendj(404,{'error':'Template not found'})
-     content=read(t)
-    write(p,content);return self.sendj(201,{'path':rel(p)})
+     content=populate_template(read(t), rel(t))
+    # Exclusive creation avoids replacing a file created between the existence check and write.
+    with open(p,'x',encoding='utf-8',newline='') as f: f.write(content)
+    return self.sendj(201,{'path':rel(p)})
    if route=='/api/mkdir':
-    p=safe(d.get('path',''));os.makedirs(p,exist_ok=True);return self.sendj(201,{'path':rel(p)})
+    p=safe(d.get('path',''))
+    if os.path.exists(p): return self.sendj(409,{'error':'A file or folder already exists at that path'})
+    parent=os.path.dirname(p)
+    if not os.path.isdir(parent): return self.sendj(400,{'error':'Parent folder does not exist'})
+    os.mkdir(p)
+    return self.sendj(201,{'path':rel(p)})
+   if route=='/api/delete':
+    path=d.get('path',''); p=safe(path)
+    if not textfile(p) or os.path.splitext(p)[1].lower() not in MD:
+     return self.sendj(400,{'error':'Only Markdown notes can be deleted'})
+    if not os.path.isfile(p): return self.sendj(404,{'error':'Markdown note not found'})
+    os.unlink(p)
+    return self.sendj(200,{'path':rel(p),'deleted':True})
    return self.sendj(404,{'error':'Unknown endpoint'})
   except Exception as e:return self.sendj(400,{'error':str(e)})
  def do_PUT(self):
