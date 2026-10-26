@@ -1,6 +1,6 @@
 "use strict";
 (() => {
-  const app = { tree: null, index: null, open: [], active: null, editors: new Map(), zen: false, typewriter: false, tableSort: "title", tableDirection: 1, editorOverrides: { numbers: "style", wrap: "style" } };
+  const app = { tree: null, index: null, open: [], active: null, editors: new Map(), zen: false, typewriter: false, tableSort: "title", tableDirection: 1, graph: { scale: 1, tx: 0, ty: 0 }, editorOverrides: { numbers: "style", wrap: "style" } };
   const $ = (selector) => document.querySelector(selector);
   const api = async (url, options = {}) => {
     const response = await fetch(url, options);
@@ -84,14 +84,14 @@
       tex: "M3 1.8h6l3 3v9.4H3z M9 1.8v3h3 M5 8h6 M8 8v5 M6 13h4",
       plus: "M8 3v10 M3 8h10", folderPlus: "M1.5 5h5l1.3 1.5h6.7v6H1.5z M1.5 5V3.7h4.2L7 5 M9 7.5v4 M7 9.5h4",
       trash: "M2.5 4.5h11 M6 2.5h4 M4 4.5l.6 9h6.8l.6-9 M6.5 6.5v4.5 M9.5 6.5v4.5", pdf: "M3 1.5h6l3 3v10H3z M9 1.5v3h3 M4.5 8h7 M4.5 10h7 M4.5 12h4",
-      table: "M2 2.5h12v11H2z M2 6h12 M2 9.5h12 M6 2.5v11 M10 2.5v11",
+      table: "M2 2.5h12v11H2z M2 6h12 M2 9.5h12 M6 2.5v11 M10 2.5v11", graph: "M3 3l5 4 5-3 M8 7v6 M8 13l-5-2 M8 13l5 1 M3 3a1.4 1.4 0 1 0 0 .1 M8 7a1.4 1.4 0 1 0 0 .1 M13 4a1.4 1.4 0 1 0 0 .1 M3 11a1.4 1.4 0 1 0 0 .1 M13 14a1.4 1.4 0 1 0 0 .1",
       save: "M2.5 2.5h9l2 2v9h-11z M5 2.5v4h5v-4 M5 13.5v-4h6v4",
       refresh: "M12.5 5.5A5 5 0 1 0 13 9 M12.5 2.5v3h-3", book: "M2.5 2.5h4a2 2 0 0 1 2 2v9a2 2 0 0 0-2-2h-4z M13.5 2.5h-3a2 2 0 0 0-2 2v9a2 2 0 0 1 2-2h3z",
     };
     return `<svg class="icon ${kind}" viewBox="0 0 16 16" aria-hidden="true"><path d="${paths[kind] || paths.md}"/></svg>`;
   };
   function setupActionIcons() {
-    const actions = {"#new-note":"plus", "#new-folder-button":"folderPlus", "#delete-note":"trash", "#open-table":"table", "#save-note":"save", "#export-pdf":"pdf", "#reindex":"refresh", "#compile-refs":"book"};
+    const actions = {"#new-note":"plus", "#new-folder-button":"folderPlus", "#delete-note":"trash", "#open-table":"table", "#open-graph":"graph", "#save-note":"save", "#export-pdf":"pdf", "#reindex":"refresh", "#compile-refs":"book"};
     for (const [selector, kind] of Object.entries(actions)) $(selector).innerHTML = icon(kind);
   }
   const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[c]);
@@ -290,6 +290,103 @@
     if (mode === "references") { const pre = document.createElement("pre"); pre.textContent = JSON.stringify(note.references, null, 2); host.append(pre); }
     else note.backlinks.forEach((path) => { const button = document.createElement("button"); button.textContent = path; button.onclick = () => openFile(path); host.append(button); });
   }
+  function graphSubset() {
+    const all = app.index?.notes || [];
+    const byPath = new Map(all.map((note) => [note.path, note]));
+    let notes = all;
+    if ($("#graph-scope").value === "local" && app.active) {
+      const current = byPath.get(app.active);
+      const neighbours = new Set([app.active, ...(current?.resolved_links || []), ...(current?.backlinks || [])]);
+      notes = all.filter((note) => neighbours.has(note.path));
+    }
+    const query = $("#graph-search").value.trim().toLocaleLowerCase();
+    if (query) {
+      const matches = notes.filter((note) => `${note.title} ${note.path} ${note.id}`.toLocaleLowerCase().includes(query));
+      if (matches.length) {
+        const selected = new Set(matches.map((note) => note.path));
+        for (const note of matches) {
+          for (const path of [...(note.resolved_links || []), ...(note.backlinks || [])]) selected.add(path);
+        }
+        notes = notes.filter((note) => selected.has(note.path));
+      } else notes = [];
+    }
+    // Keep the SVG responsive on very large vaults; users can search or use the local view.
+    const capped = notes.length > 250;
+    if (capped) notes = notes.slice(0, 250);
+    const paths = new Set(notes.map((note) => note.path));
+    const edges = [];
+    for (const note of notes) for (const target of (note.resolved_links || [])) {
+      if (paths.has(target) && note.path !== target) edges.push({ source: note.path, target });
+    }
+    return { notes, edges, capped };
+  }
+  function renderGraph() {
+    const host = $("#graph-canvas");
+    host.replaceChildren();
+    const { notes, edges, capped } = graphSubset();
+    $("#graph-status").textContent = `${notes.length} notes · ${edges.length} links${capped ? " · showing first 250; search or use local view" : ""}`;
+    if (!notes.length) { host.textContent = app.index?.notes?.length ? "No notes match this graph view." : "No notes found in the vault."; return; }
+    const NS = "http://www.w3.org/2000/svg", width = Math.max(720, host.clientWidth || 900), height = Math.max(440, host.clientHeight || 620);
+    const svg = document.createElementNS(NS, "svg"); svg.setAttribute("viewBox", `0 0 ${width} ${height}`); svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Graph of connected notes");
+    const defs = document.createElementNS(NS, "defs"), marker = document.createElementNS(NS, "marker"); marker.setAttribute("id", "graph-arrow"); marker.setAttribute("viewBox", "0 0 10 10"); marker.setAttribute("refX", "8"); marker.setAttribute("refY", "5"); marker.setAttribute("markerWidth", "5"); marker.setAttribute("markerHeight", "5"); marker.setAttribute("orient", "auto-start-reverse");
+    const arrow = document.createElementNS(NS, "path"); arrow.setAttribute("d", "M 0 0 L 10 5 L 0 10 z"); arrow.setAttribute("fill", "var(--muted)"); marker.append(arrow); defs.append(marker); svg.append(defs);
+    const viewport = document.createElementNS(NS, "g"); viewport.classList.add("graph-viewport"); svg.append(viewport);
+    const count = notes.length, centerX = width / 2, centerY = height / 2, radius = Math.min(width, height) * 0.34;
+    const nodes = notes.map((note, i) => ({ note, x: centerX + radius * Math.cos(2 * Math.PI * i / count), y: centerY + radius * Math.sin(2 * Math.PI * i / count), vx: 0, vy: 0 }));
+    const nodeByPath = new Map(nodes.map((node) => [node.note.path, node]));
+    // Small deterministic force layout: spring attraction for linked notes and repulsion between nodes.
+    if (nodes.length <= 150) {
+      for (let iter = 0; iter < 90; iter++) {
+        for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j], dx = b.x - a.x, dy = b.y - a.y, d2 = Math.max(36, dx * dx + dy * dy), force = Math.min(1.8, 850 / d2);
+          a.vx -= dx * force * 0.012; a.vy -= dy * force * 0.012; b.vx += dx * force * 0.012; b.vy += dy * force * 0.012;
+        }
+        for (const edge of edges) {
+          const a = nodeByPath.get(edge.source), b = nodeByPath.get(edge.target); if (!a || !b) continue;
+          const dx = b.x - a.x, dy = b.y - a.y, d = Math.max(1, Math.hypot(dx, dy)), force = (d - 100) * 0.0018;
+          a.vx += dx / d * force; a.vy += dy / d * force; b.vx -= dx / d * force; b.vy -= dy / d * force;
+        }
+        for (const node of nodes) { node.vx *= 0.82; node.vy *= 0.82; node.x = Math.max(32, Math.min(width - 32, node.x + node.vx)); node.y = Math.max(32, Math.min(height - 32, node.y + node.vy)); }
+      }
+    }
+    const lineEls = [];
+    for (const edge of edges) {
+      const a = nodeByPath.get(edge.source), b = nodeByPath.get(edge.target); if (!a || !b) continue;
+      const line = document.createElementNS(NS, "line"); line.setAttribute("class", "graph-edge"); line.setAttribute("marker-end", "url(#graph-arrow)"); viewport.append(line); lineEls.push({ line, a, b });
+    }
+    const nodeEls = [];
+    for (const node of nodes) {
+      const group = document.createElementNS(NS, "g"); group.setAttribute("class", `graph-node${node.note.path === app.active ? " is-current" : ""}`); group.setAttribute("tabindex", "0"); group.setAttribute("role", "button"); group.setAttribute("aria-label", `Open ${node.note.title || node.note.path}`); group.style.cursor = "grab";
+      const circle = document.createElementNS(NS, "circle"); circle.setAttribute("r", node.note.path === app.active ? "8" : "6"); group.append(circle);
+      const label = document.createElementNS(NS, "text"); label.textContent = node.note.title || node.note.path; label.setAttribute("x", "10"); label.setAttribute("y", "4"); label.setAttribute("class", "graph-label"); group.append(label); viewport.append(group);
+      const open = () => { if (node.wasDragged) { node.wasDragged = false; return; } $("#graph-dialog").close(); openFile(node.note.path).catch((error) => alert(`Could not open note: ${error.message}`)); };
+      group.addEventListener("click", open); group.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
+      group.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; event.stopPropagation(); group.setPointerCapture(event.pointerId); group.style.cursor = "grabbing"; node.drag = { x: event.clientX, y: event.clientY }; });
+      group.addEventListener("pointermove", (event) => { if (!node.drag || !group.hasPointerCapture(event.pointerId)) return; const rect = svg.getBoundingClientRect(), dx = (event.clientX - node.drag.x) * width / rect.width / app.graph.scale, dy = (event.clientY - node.drag.y) * height / rect.height / app.graph.scale; if (Math.abs(dx) + Math.abs(dy) > 1) node.wasDragged = true; node.x += dx; node.y += dy; node.drag = { x: event.clientX, y: event.clientY }; updatePositions(); });
+      const endDrag = () => { node.drag = null; group.style.cursor = "grab"; };
+      group.addEventListener("pointerup", endDrag); group.addEventListener("pointercancel", endDrag);
+      nodeEls.push({ group, node });
+    }
+    function updatePositions() {
+      for (const { line, a, b } of lineEls) { line.setAttribute("x1", a.x); line.setAttribute("y1", a.y); line.setAttribute("x2", b.x); line.setAttribute("y2", b.y); }
+      for (const { group, node } of nodeEls) group.setAttribute("transform", `translate(${node.x} ${node.y})`);
+    }
+    updatePositions();
+    const applyTransform = () => viewport.setAttribute("transform", `translate(${app.graph.tx} ${app.graph.ty}) scale(${app.graph.scale})`);
+    app.graph.scale = 1; app.graph.tx = 0; app.graph.ty = 0; applyTransform();
+    svg.addEventListener("wheel", (event) => { event.preventDefault(); const factor = event.deltaY < 0 ? 1.1 : 0.9; app.graph.scale = Math.max(0.35, Math.min(3, app.graph.scale * factor)); applyTransform(); }, { passive: false });
+    let pan = null;
+    svg.addEventListener("pointerdown", (event) => { if (event.target.closest?.(".graph-node")) return; pan = { x: event.clientX, y: event.clientY, tx: app.graph.tx, ty: app.graph.ty }; svg.setPointerCapture(event.pointerId); });
+    svg.addEventListener("pointermove", (event) => { if (!pan || !svg.hasPointerCapture(event.pointerId)) return; app.graph.tx = pan.tx + event.clientX - pan.x; app.graph.ty = pan.ty + event.clientY - pan.y; applyTransform(); });
+    svg.addEventListener("pointerup", () => { pan = null; }); svg.addEventListener("pointercancel", () => { pan = null; });
+    host.append(svg);
+  }
+  function openGraph() {
+    $("#graph-search").value = "";
+    $("#graph-scope").value = app.active ? "local" : "global";
+    renderGraph();
+    $("#graph-dialog").showModal();
+  }
   async function exportActivePdf() {
     if (!app.active) { alert("Open a note before exporting to PDF."); return; }
     const item=app.editors.get(app.active); if(!item) return;
@@ -403,6 +500,10 @@
     $("#new-folder-button").onclick = createFolder;
     $("#delete-note").onclick = deleteActiveNote;
     $("#open-table").onclick = openNotesTable;
+    $("#open-graph").onclick = openGraph;
+    $("#close-graph").onclick = () => $("#graph-dialog").close();
+    $("#graph-scope").onchange = renderGraph;
+    $("#graph-search").addEventListener("input", debounce(renderGraph, 180));
     ["#table-tag-filter","#table-topic-filter","#table-status-filter","#table-category-filter","#table-author-filter","#table-participant-filter","#table-keyword-filter"].forEach(id=>$(id).onchange=renderNotesTable);
     document.querySelectorAll("#notes-table [data-sort]").forEach((button) => button.addEventListener("click", () => {
       const key = button.dataset.sort;
@@ -426,6 +527,7 @@
       observer.observe($("#editor-host"));
     }
     window.addEventListener("resize", resizeActiveEditor);
+    window.addEventListener("resize", debounce(() => { if ($("#graph-dialog").open) renderGraph(); }, 120));
     window.addEventListener("beforeunload", (event) => {
       if ([...app.editors.values()].some((item) => item.dirty)) { event.preventDefault(); event.returnValue = ""; }
     });
@@ -441,5 +543,5 @@
     });
   }
   async function start() { loadEditorSettings(); [app.tree, app.index] = await Promise.all([api("/api/tree"), api("/api/index")]); renderTree(); renderFilters(); await bind(); updateShortcutHelp(); applyPalette(localStorage.getItem("vault-palette") || "slate"); applyFont(localStorage.getItem("vault-font-size") || 14); applyStyle(Number(localStorage.getItem("vault-style") || 0)); setTypewriter(localStorage.getItem("vault-typewriter") === "1"); }
-  start().catch((e) => { console.error(e); alert(`Vault startup failed: ${e.message}`); });
+  start().catch((e) => { console.error(e); alert(`noteBrain startup failed: ${e.message}`); });
 })();

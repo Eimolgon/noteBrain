@@ -1,6 +1,6 @@
 # Bundled frontend libraries
 
-These files are included so Vault Workbench can run without internet access or a package manager.
+These files are included so noteBrain can run without internet access or a package manager.
 
 - **CodeMirror** 5.58.3 — `codemirror/`; MIT license. Upstream: https://codemirror.net/
 - **Marked** 4.0.19 — `marked/`; MIT license. Upstream: https://marked.js.org/
